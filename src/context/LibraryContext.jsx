@@ -31,6 +31,28 @@ function loadLocal(key, fallback) {
   }
 }
 
+// Large catalogues belong in the database, not browser localStorage.
+// Keep only small catalogues in the browser cache to avoid quota failures.
+function cacheBooksLocally(books) {
+  try {
+    if (!Array.isArray(books) || books.length > 5000) {
+      localStorage.removeItem('sggs_books');
+      return;
+    }
+    localStorage.setItem('sggs_books', JSON.stringify(books));
+  } catch (error) {
+    console.warn('Book catalogue was not cached locally:', error);
+  }
+}
+
+function safeSetLocal(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    console.warn(`Unable to cache ${key} locally:`, error);
+  }
+}
+
 const initialContent = {
   books: loadLocal('sggs_books', defaultBooks),
   departments: loadLocal('sggs_departments', departments),
@@ -162,27 +184,24 @@ export function LibraryProvider({ children }) {
         if (Array.isArray(data.books)) {
           setBooks(data.books);
 
-          localStorage.setItem(
-            'sggs_books',
-            JSON.stringify(data.books)
-          );
+          cacheBooksLocally(data.books);
         }
 
         if (Array.isArray(data.departments)) {
           setDepartmentsData(data.departments);
 
-          localStorage.setItem(
+          safeSetLocal(
             'sggs_departments',
-            JSON.stringify(data.departments)
+            data.departments
           );
         }
 
         if (Array.isArray(data.resources)) {
           setResources(data.resources);
 
-          localStorage.setItem(
+          safeSetLocal(
             'sggs_resources',
-            JSON.stringify(data.resources)
+            data.resources
           );
         }
 
@@ -198,18 +217,18 @@ export function LibraryProvider({ children }) {
         if (Array.isArray(data.announcements)) {
           setAnnouncements(data.announcements);
 
-          localStorage.setItem(
+          safeSetLocal(
             'sggs_announcements',
-            JSON.stringify(data.announcements)
+            data.announcements
           );
         }
 
         if (Array.isArray(data.publications)) {
           setPublications(data.publications);
 
-          localStorage.setItem(
+          safeSetLocal(
             'sggs_publications',
-            JSON.stringify(data.publications)
+            data.publications
           );
         }
 
@@ -220,9 +239,9 @@ export function LibraryProvider({ children }) {
         ) {
           setSite(data.site);
 
-          localStorage.setItem(
+          safeSetLocal(
             'sggs_site',
-            JSON.stringify(data.site)
+            data.site
           );
         }
 
@@ -364,19 +383,16 @@ export function LibraryProvider({ children }) {
        * Keep localStorage as a local cache only.
        */
 
-      localStorage.setItem(
-        'sggs_books',
-        JSON.stringify(content.books)
-      );
+      cacheBooksLocally(content.books);
 
-      localStorage.setItem(
+      safeSetLocal(
         'sggs_departments',
-        JSON.stringify(content.departments)
+        content.departments
       );
 
-      localStorage.setItem(
+      safeSetLocal(
         'sggs_resources',
-        JSON.stringify(content.resources)
+        content.resources
       );
 
       // localStorage.setItem(
@@ -384,19 +400,19 @@ export function LibraryProvider({ children }) {
       //   JSON.stringify(content.papers)
       // );
 
-      localStorage.setItem(
+      safeSetLocal(
         'sggs_announcements',
-        JSON.stringify(content.announcements)
+        content.announcements
       );
 
-      localStorage.setItem(
+      safeSetLocal(
         'sggs_publications',
-        JSON.stringify(content.publications)
+        content.publications
       );
 
-      localStorage.setItem(
+      safeSetLocal(
         'sggs_site',
-        JSON.stringify(content.site)
+        content.site
       );
 
       setToast('Changes saved successfully');

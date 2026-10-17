@@ -4,7 +4,10 @@ import {
   Trash2,
   Pencil,
   Upload,
-  X
+  X,
+  Search,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 
 import { useLibrary } from '../../context/LibraryContext';
@@ -29,6 +32,7 @@ const emptyForm = {
 };
 
 const normalizeBook = (book, index = 0) => ({
+  ...book,
   id:
     book.id ||
     `b${Date.now()}${index}`,
@@ -74,6 +78,11 @@ export default function ManageBooks() {
 
   const [importing, setImporting] =
     useState(false);
+
+  const [searchInput, setSearchInput] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
   const updateField = (
     field,
@@ -320,34 +329,73 @@ export default function ManageBooks() {
       return [];
     }
 
-    const headers = rows[0].map(
-      (header) =>
-        header
-          .trim()
-          .toLowerCase()
-    );
+    const normalizeHeader = (header) =>
+      String(header || '')
+        .replace(/^\\uFEFF/, '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+
+    const headers = rows[0].map(normalizeHeader);
+    const aliases = {
+      title: ['title', 'booktitle', 'bookname', 'name', 'itemtitle', 'descriptionoftitle'],
+      author: ['author', 'authors', 'authorname', 'creator'],
+      department: ['department', 'dept', 'subject', 'category', 'branch'],
+      year: ['year', 'publicationyear', 'published', 'yearofpublication'],
+      isbn: ['isbn', 'isbnnumber', 'isbn13', 'isbn10'],
+      copies: ['copies', 'totalcopies', 'quantity', 'qty', 'numberofcopies'],
+      available: ['available', 'availablecopies', 'availability'],
+      rack: ['rack', 'rackno', 'racknumber', 'location'],
+      shelf: ['shelf', 'shelfno', 'shelfnumber'],
+      barcode: ['barcode', 'barcodeno', 'barcodenumber', 'accessionno', 'accessionnumber', 'accession'],
+      id: ['id', 'bookid', 'recordid', 'itemid'],
+    };
+    const findHeader = (field) =>
+      headers.findIndex((header) => aliases[field]?.includes(header));
 
     return rows
       .slice(1)
       .map((cells, index) => {
         const record = {};
+        headers.forEach((header, columnIndex) => {
+          record[header || `column${columnIndex + 1}`] =
+            String(cells[columnIndex] ?? '').trim();
+        });
 
-        headers.forEach(
-          (header, columnIndex) => {
-            record[header] =
-              cells[columnIndex]
-                ?.trim() || '';
+        Object.entries(aliases).forEach(([field]) => {
+          const columnIndex = findHeader(field);
+          if (columnIndex >= 0) {
+            record[field] = String(cells[columnIndex] ?? '').trim();
           }
+        });
+
+        // Keep every original CSV column so barcode/accession metadata is not lost.
+        record.csvData = Object.fromEntries(
+          headers.map((header, columnIndex) => [
+            header || `column${columnIndex + 1}`,
+            String(cells[columnIndex] ?? '').trim(),
+          ])
         );
 
-        return normalizeBook(
-          record,
-          index
-        );
+        if (!record.title) {
+          record.title =
+            record.csvData.booktitle ||
+            record.csvData.bookname ||
+            record.csvData.name ||
+            record.csvData.title ||
+            '';
+        }
+
+        const stableKey = record.barcode || record.isbn ||
+          `${record.title}|${record.author}|${record.department}|${index}`;
+        return normalizeBook({
+          ...record,
+          id: record.id || `csv-${stableKey}`,
+          copies: record.copies === '' ? 1 : record.copies,
+          available: record.available === '' ? record.copies || 1 : record.available,
+        }, index);
       })
-      .filter(
-        (book) => book.title
-      );
+      .filter((book) => book.title);
   };
 
   const importCSV = async (e) => {
@@ -374,14 +422,35 @@ export default function ManageBooks() {
         return;
       }
 
-      const nextBooks =
-        importedBooks.map(
-          (book, index) => ({
-            ...book,
-            id: `b${Date.now()}${index}`
-          })
-        );
+      // Append imported records and update matching ISBN/barcode records.
+      // Existing catalogue entries are retained.
+      const keyOf = (book) => {
+        const barcode = String(book.barcode || book.accession || '').trim().toLowerCase();
+        const isbn = String(book.isbn || '').replace(/[^0-9x]/gi, '').toLowerCase();
+        if (barcode) return `barcode:${barcode}`;
+        if (isbn) return `isbn:${isbn}`;
+        return `title-author:${String(book.title || '').trim().toLowerCase()}|${String(book.author || '').trim().toLowerCase()}`;
+      };
 
+      const mergedByKey = new Map();
+      books.forEach((book) => mergedByKey.set(keyOf(book), book));
+      let addedCount = 0;
+      let updatedCount = 0;
+
+      importedBooks.forEach((book, index) => {
+        const key = keyOf(book);
+        const existing = mergedByKey.get(key);
+        const nextRecord = {
+          ...existing,
+          ...book,
+          id: existing?.id || book.id || `csv-${Date.now()}-${index}`,
+        };
+        if (existing) updatedCount += 1;
+        else addedCount += 1;
+        mergedByKey.set(key, nextRecord);
+      });
+
+      const nextBooks = Array.from(mergedByKey.values());
       setBooks(nextBooks);
 
       await saveContent({
@@ -391,7 +460,7 @@ export default function ManageBooks() {
       resetForm();
 
       setToast(
-        `${nextBooks.length} catalogue records imported`
+        `CSV processed: ${addedCount} added, ${updatedCount} updated. Total catalogue records: ${nextBooks.length}.`
       );
     } catch (error) {
       console.error(
@@ -410,6 +479,33 @@ export default function ManageBooks() {
           '';
       }
     }
+  };
+
+  const searchableValue = (book) => [
+    book.title,
+    book.author,
+    book.isbn,
+    book.barcode,
+    book.accession,
+    book.department,
+    book.rack,
+    book.shelf,
+    book.id,
+    ...(book.csvData ? Object.values(book.csvData) : []),
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  const filteredBooks = searchQuery.trim()
+    ? books.filter((book) => searchableValue(book).includes(searchQuery.trim().toLowerCase()))
+    : books;
+
+  const totalPages = Math.max(1, Math.ceil(filteredBooks.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+  const visibleBooks = filteredBooks.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  const runSearch = (e) => {
+    e?.preventDefault();
+    setSearchQuery(searchInput.trim());
+    setCurrentPage(1);
   };
 
   return (
@@ -641,6 +737,46 @@ export default function ManageBooks() {
         </button>
       </div>
 
+      <form
+        onSubmit={runSearch}
+        style={{
+          display: 'flex',
+          gap: '10px',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          margin: '20px 0 12px',
+        }}
+      >
+        <input
+          type="search"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder="Search title, author, ISBN, barcode, rack..."
+          aria-label="Search books"
+          style={{ flex: '1 1 320px', minWidth: 0 }}
+        />
+        <button type="submit" className="primary-btn">
+          <Search size={16} /> Search books
+        </button>
+        <button
+          type="button"
+          className="danger"
+          onClick={() => {
+            setSearchInput('');
+            setSearchQuery('');
+            setCurrentPage(1);
+          }}
+        >
+          Clear
+        </button>
+      </form>
+
+      <p style={{ margin: '8px 0 14px' }}>
+        Showing {filteredBooks.length ? (safePage - 1) * pageSize + 1 : 0}–{Math.min(safePage * pageSize, filteredBooks.length)}
+        {' '}of {filteredBooks.length.toLocaleString()} matching records
+        {' '}({books.length.toLocaleString()} total).
+      </p>
+
       <DataTable
         headers={[
           'Book',
@@ -648,7 +784,7 @@ export default function ManageBooks() {
           'Availability',
           'Action'
         ]}
-        rows={books.map((book) => (
+        rows={visibleBooks.map((book) => (
           <React.Fragment
             key={book.id}
           >
@@ -701,6 +837,27 @@ export default function ManageBooks() {
           </React.Fragment>
         ))}
       />
+
+      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', marginTop: '16px' }}>
+        <label style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          Rows per page
+          <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}>
+            <option value={25}>25</option>
+            <option value={50}>50</option>
+            <option value={100}>100</option>
+            <option value={200}>200</option>
+          </select>
+        </label>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <button type="button" className="primary-btn" disabled={safePage <= 1} onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}>
+            <ChevronLeft size={16} /> Previous
+          </button>
+          <span>Page {safePage} of {totalPages}</span>
+          <button type="button" className="primary-btn" disabled={safePage >= totalPages} onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}>
+            Next <ChevronRight size={16} />
+          </button>
+        </div>
+      </div>
     </AdminPage>
   );
 }
