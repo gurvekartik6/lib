@@ -53,6 +53,62 @@ function safeSetLocal(key, value) {
   }
 }
 
+const BOOK_BATCH_SIZE = 500;
+const BOOK_PAGE_SIZE = 1000;
+
+async function readBooksFromDatabase() {
+  const firstResponse = await fetch(
+    `/api/books?limit=${BOOK_PAGE_SIZE}&offset=0`,
+    { credentials: 'include', cache: 'no-store' }
+  );
+
+  if (!firstResponse.ok) {
+    throw new Error(`Books API returned ${firstResponse.status}`);
+  }
+
+  const firstPage = await firstResponse.json();
+  const allBooks = Array.isArray(firstPage.items)
+    ? [...firstPage.items]
+    : [];
+  const total = Number(firstPage.total) || allBooks.length;
+
+  for (
+    let start = BOOK_PAGE_SIZE;
+    start < total;
+    start += BOOK_PAGE_SIZE * 8
+  ) {
+    const offsets = [];
+
+    for (
+      let offset = start;
+      offset < Math.min(start + BOOK_PAGE_SIZE * 8, total);
+      offset += BOOK_PAGE_SIZE
+    ) {
+      offsets.push(offset);
+    }
+
+    const pages = await Promise.all(
+      offsets.map(async (offset) => {
+        const response = await fetch(
+          `/api/books?limit=${BOOK_PAGE_SIZE}&offset=${offset}`,
+          { credentials: 'include', cache: 'no-store' }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Books API returned ${response.status}`);
+        }
+
+        const page = await response.json();
+        return Array.isArray(page.items) ? page.items : [];
+      })
+    );
+
+    pages.forEach((page) => allBooks.push(...page));
+  }
+
+  return allBooks;
+}
+
 const initialContent = {
   books: loadLocal('sggs_books', defaultBooks),
   departments: loadLocal('sggs_departments', departments),
@@ -92,9 +148,7 @@ export function LibraryProvider({ children }) {
     initialContent.publications
   );
 
-  const [site, setSite] = useState(
-    initialContent.site
-  );
+  const [site, setSite] = useState(initialContent.site);
 
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
@@ -181,11 +235,40 @@ export function LibraryProvider({ children }) {
 
         if (!active) return;
 
-        if (Array.isArray(data.books)) {
-          setBooks(data.books);
+        let loadedBooks = Array.isArray(data.books)
+          ? data.books
+          : [];
 
-          cacheBooksLocally(data.books);
+        try {
+          const databaseBooks = await readBooksFromDatabase();
+
+          if (databaseBooks.length > 0) {
+            loadedBooks = databaseBooks;
+          } else if (loadedBooks.length > 0) {
+            // Migrate the small legacy JSONB catalogue once,
+            // before the first new-table write.
+            const migrationResponse = await fetch('/api/books', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ books: loadedBooks }),
+            });
+
+            if (!migrationResponse.ok) {
+              console.warn(
+                'Legacy books could not be migrated to the books table.'
+              );
+            }
+          }
+        } catch (booksError) {
+          console.warn(
+            'Could not load the separate books table; using legacy content books:',
+            booksError
+          );
         }
+
+        setBooks(loadedBooks);
+        cacheBooksLocally(loadedBooks);
 
         if (Array.isArray(data.departments)) {
           setDepartmentsData(data.departments);
@@ -207,7 +290,7 @@ export function LibraryProvider({ children }) {
 
         // if (Array.isArray(data.papers)) {
         //   setPapers(data.papers);
-
+        //
         //   localStorage.setItem(
         //     'sggs_papers',
         //     JSON.stringify(data.papers)
@@ -303,28 +386,149 @@ export function LibraryProvider({ children }) {
 
   /*
    * =========================================================
+   * SAVE BOOKS IN BATCHES
+   * =========================================================
+   */
+
+  const saveBooksInBatches = async (allBooks) => {
+    if (!Array.isArray(allBooks)) {
+      throw new Error('Books must be provided as an array');
+    }
+
+    const batches = [];
+
+    for (
+      let start = 0;
+      start < allBooks.length;
+      start += BOOK_BATCH_SIZE
+    ) {
+      batches.push(
+        allBooks.slice(start, start + BOOK_BATCH_SIZE)
+      );
+    }
+
+    let completed = 0;
+    const concurrency = 4;
+
+    for (
+      let start = 0;
+      start < batches.length;
+      start += concurrency
+    ) {
+      const group = batches.slice(start, start + concurrency);
+
+      await Promise.all(
+        group.map(async (batch) => {
+          const response = await fetch('/api/books', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ books: batch }),
+          });
+
+          const result = await response.json().catch(() => ({}));
+
+          if (!response.ok) {
+            throw new Error(
+              result.error ||
+              `Book batch save failed (${response.status})`
+            );
+          }
+
+          completed += 1;
+
+          setToast(
+            `Saving catalogue batches: ${completed} of ${batches.length}…`
+          );
+        })
+      );
+    }
+
+    cacheBooksLocally(allBooks);
+
+    return {
+      ok: true,
+      count: allBooks.length,
+    };
+  };
+
+  const saveBook = async (book) => {
+    const response = await fetch('/api/books', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ books: [book] }),
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        result.error || `Book save failed (${response.status})`
+      );
+    }
+
+    return result;
+  };
+
+  const deleteBook = async (id) => {
+    const response = await fetch('/api/books', {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        result.error || `Book delete failed (${response.status})`
+      );
+    }
+
+    return result;
+  };
+
+  const clearBooks = async () => {
+    const response = await fetch('/api/books', {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ all: true }),
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        result.error || `Catalogue reset failed (${response.status})`
+      );
+    }
+
+    return result;
+  };
+
+  /*
+   * =========================================================
    * SAVE ALL CONTENT TO NEON
    * =========================================================
    *
-   * Admin pages can call:
-   *
-   * await saveContent()
-   *
-   * This sends the current application state to /api/content.
+   * Books are stored separately in the books table.
+   * This function saves the smaller site content through /api/content.
    */
 
-  const saveContent = async (
-    overrides = {}
-  ) => {
+  const saveContent = async (overrides = {}) => {
     setContentSaving(true);
 
     try {
-      const content = {
-        books:
-          overrides.books !== undefined
-            ? overrides.books
-            : books,
+      if (overrides.books !== undefined) {
+        await saveBooksInBatches(overrides.books);
+      }
 
+      const content = {
+        // Books are stored in the dedicated books table;
+        // do not send the catalogue to /api/content.
         departments:
           overrides.departments !== undefined
             ? overrides.departments
@@ -356,21 +560,16 @@ export function LibraryProvider({ children }) {
             : site,
       };
 
-      const response = await fetch(
-        '/api/content',
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(content),
-        }
-      );
+      const response = await fetch('/api/content', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(content),
+      });
 
-      const data = await response
-        .json()
-        .catch(() => ({}));
+      const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
         throw new Error(
@@ -382,8 +581,6 @@ export function LibraryProvider({ children }) {
       /*
        * Keep localStorage as a local cache only.
        */
-
-      cacheBooksLocally(content.books);
 
       safeSetLocal(
         'sggs_departments',
@@ -459,18 +656,13 @@ export function LibraryProvider({ children }) {
       file
     );
 
-    const response = await fetch(
-      '/api/upload',
-      {
-        method: 'POST',
-        credentials: 'include',
-        body: formData,
-      }
-    );
+    const response = await fetch('/api/upload', {
+      method: 'POST',
+      credentials: 'include',
+      body: formData,
+    });
 
-    const data = await response
-      .json()
-      .catch(() => ({}));
+    const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
       throw new Error(
@@ -496,29 +688,20 @@ export function LibraryProvider({ children }) {
    * =========================================================
    */
 
-  const login = async (
-    email,
-    password
-  ) => {
-    const response = await fetch(
-      '/api/auth/login',
-      {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type':
-            'application/json',
-        },
-        body: JSON.stringify({
-          email,
-          password,
-        }),
-      }
-    );
+  const login = async (email, password) => {
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email,
+        password,
+      }),
+    });
 
-    const data = await response
-      .json()
-      .catch(() => ({}));
+    const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
       throw new Error(
@@ -540,13 +723,10 @@ export function LibraryProvider({ children }) {
 
   const logout = async () => {
     try {
-      await fetch(
-        '/api/auth/logout',
-        {
-          method: 'POST',
-          credentials: 'include',
-        }
-      );
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+      });
     } catch {
       // Ignore logout network errors.
     }
@@ -590,10 +770,8 @@ export function LibraryProvider({ children }) {
     const nextDepartments = clone(departments);
     const nextResources = clone(defaultResources);
     // const nextPapers = clone(defaultPapers);
-    const nextAnnouncements =
-      clone(defaultAnnouncements);
-    const nextPublications =
-      clone(defaultPublications);
+    const nextAnnouncements = clone(defaultAnnouncements);
+    const nextPublications = clone(defaultPublications);
     const nextSite = clone(defaultSite);
 
     setBooks(nextBooks);
@@ -604,8 +782,10 @@ export function LibraryProvider({ children }) {
     setPublications(nextPublications);
     setSite(nextSite);
 
+    await clearBooks();
+    await saveBooksInBatches(nextBooks);
+
     await saveContent({
-      books: nextBooks,
       departments: nextDepartments,
       resources: nextResources,
       // papers: nextPapers,
@@ -630,10 +810,8 @@ export function LibraryProvider({ children }) {
       books,
       setBooks,
 
-      departments:
-        departmentsData,
-      setDepartments:
-        setDepartmentsData,
+      departments: departmentsData,
+      setDepartments: setDepartmentsData,
 
       resources,
       setResources,
@@ -660,6 +838,10 @@ export function LibraryProvider({ children }) {
       logout,
 
       saveContent,
+      saveBooksInBatches,
+      saveBook,
+      deleteBook,
+      clearBooks,
       uploadMedia,
 
       theme,
