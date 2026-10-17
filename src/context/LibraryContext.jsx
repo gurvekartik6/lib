@@ -20,113 +20,321 @@ import {
 
 const Ctx = createContext(null);
 
+/*
+ * =========================================================
+ * CONFIGURATION
+ * =========================================================
+ */
+
+const BOOKS_API = '/api/books';
+const CONTENT_API = '/api/content';
+
+const BOOK_PAGE_SIZE = 1000;
+const BOOK_BATCH_SIZE = 500;
+const BOOK_SAVE_CONCURRENCY = 4;
+
+/*
+ * =========================================================
+ * SAFE LOCAL STORAGE HELPERS
+ * =========================================================
+ */
+
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function loadLocal(key, fallback) {
   try {
+    // Large catalogues must not be loaded from localStorage.
+    if (key === 'sggs_books') {
+      localStorage.removeItem('sggs_books');
+      return clone(fallback);
+    }
+
     const stored = localStorage.getItem(key);
+
     return stored ? JSON.parse(stored) : clone(fallback);
   } catch {
     return clone(fallback);
   }
 }
 
-// Large catalogues belong in the database, not browser localStorage.
-// Keep only small catalogues in the browser cache to avoid quota failures.
 function cacheBooksLocally(books) {
   try {
+    // Keep the entire catalogue in Neon, not browser storage.
     if (!Array.isArray(books) || books.length > 5000) {
       localStorage.removeItem('sggs_books');
       return;
     }
-    localStorage.setItem('sggs_books', JSON.stringify(books));
+
+    localStorage.setItem(
+      'sggs_books',
+      JSON.stringify(books)
+    );
   } catch (error) {
-    console.warn('Book catalogue was not cached locally:', error);
+    console.warn(
+      'Book catalogue was not cached locally:',
+      error
+    );
   }
 }
 
 function safeSetLocal(key, value) {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (error) {
-    console.warn(`Unable to cache ${key} locally:`, error);
-  }
-}
-
-const BOOK_BATCH_SIZE = 500;
-const BOOK_PAGE_SIZE = 1000;
-
-async function readBooksFromDatabase() {
-  const firstResponse = await fetch(
-    `/api/books?limit=${BOOK_PAGE_SIZE}&offset=0`,
-    { credentials: 'include', cache: 'no-store' }
-  );
-
-  if (!firstResponse.ok) {
-    throw new Error(`Books API returned ${firstResponse.status}`);
-  }
-
-  const firstPage = await firstResponse.json();
-  const allBooks = Array.isArray(firstPage.items)
-    ? [...firstPage.items]
-    : [];
-  const total = Number(firstPage.total) || allBooks.length;
-
-  for (
-    let start = BOOK_PAGE_SIZE;
-    start < total;
-    start += BOOK_PAGE_SIZE * 8
-  ) {
-    const offsets = [];
-
-    for (
-      let offset = start;
-      offset < Math.min(start + BOOK_PAGE_SIZE * 8, total);
-      offset += BOOK_PAGE_SIZE
-    ) {
-      offsets.push(offset);
-    }
-
-    const pages = await Promise.all(
-      offsets.map(async (offset) => {
-        const response = await fetch(
-          `/api/books?limit=${BOOK_PAGE_SIZE}&offset=${offset}`,
-          { credentials: 'include', cache: 'no-store' }
-        );
-
-        if (!response.ok) {
-          throw new Error(`Books API returned ${response.status}`);
-        }
-
-        const page = await response.json();
-        return Array.isArray(page.items) ? page.items : [];
-      })
+    localStorage.setItem(
+      key,
+      JSON.stringify(value)
     );
-
-    pages.forEach((page) => allBooks.push(...page));
+  } catch (error) {
+    console.warn(
+      `Unable to cache ${key} locally:`,
+      error
+    );
   }
-
-  return allBooks;
 }
+
+function getLocalTheme() {
+  try {
+    return localStorage.getItem('sggs_theme') || 'light';
+  } catch {
+    return 'light';
+  }
+}
+
+/*
+ * =========================================================
+ * INITIAL CONTENT
+ * =========================================================
+ *
+ * Books are loaded separately from /api/books.
+ * Other content continues to use /api/content.
+ */
 
 const initialContent = {
   books: loadLocal('sggs_books', defaultBooks),
-  departments: loadLocal('sggs_departments', departments),
-  resources: loadLocal('sggs_resources', defaultResources),
+
+  departments: loadLocal(
+    'sggs_departments',
+    departments
+  ),
+
+  resources: loadLocal(
+    'sggs_resources',
+    defaultResources
+  ),
+
   // papers: loadLocal('sggs_papers', defaultPapers),
+
   announcements: loadLocal(
     'sggs_announcements',
     defaultAnnouncements
   ),
+
   publications: loadLocal(
     'sggs_publications',
     defaultPublications
   ),
-  site: loadLocal('sggs_site', defaultSite),
+
+  site: loadLocal(
+    'sggs_site',
+    defaultSite
+  ),
 };
 
+/*
+ * =========================================================
+ * API HELPERS
+ * =========================================================
+ */
+
+async function readApiResponse(response, fallbackMessage) {
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      data.error ||
+        `${fallbackMessage} (${response.status})`
+    );
+  }
+
+  return data;
+}
+
+/*
+ * Load only the first page of books into shared React state.
+ *
+ * The public catalogue should fetch its own small pages
+ * directly from /api/books.
+ *
+ * This prevents the entire catalogue from being loaded
+ * into React context on every page.
+ */
+
+async function readBooksFromDatabase() {
+  const query = new URLSearchParams({
+    limit: String(BOOK_PAGE_SIZE),
+    offset: '0',
+  });
+
+  const response = await fetch(
+    `${BOOKS_API}?${query.toString()}`,
+    {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    }
+  );
+
+  const data = await readApiResponse(
+    response,
+    'Unable to load books'
+  );
+
+  return Array.isArray(data.items)
+    ? data.items
+    : [];
+}
+
+/*
+ * Save books in batches instead of sending one enormous
+ * request to /api/content.
+ */
+
+async function postBookBatch(batch) {
+  if (!batch.length) return;
+
+  const response = await fetch(BOOKS_API, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      books: batch,
+    }),
+  });
+
+  await readApiResponse(
+    response,
+    'Unable to save book records'
+  );
+}
+
+async function saveBooksInBatches(allBooks) {
+  if (!Array.isArray(allBooks)) {
+    throw new Error('Books must be an array.');
+  }
+
+  const batches = [];
+
+  for (
+    let index = 0;
+    index < allBooks.length;
+    index += BOOK_BATCH_SIZE
+  ) {
+    batches.push(
+      allBooks.slice(
+        index,
+        index + BOOK_BATCH_SIZE
+      )
+    );
+  }
+
+  // Run a limited number of requests concurrently.
+  for (
+    let index = 0;
+    index < batches.length;
+    index += BOOK_SAVE_CONCURRENCY
+  ) {
+    const group = batches.slice(
+      index,
+      index + BOOK_SAVE_CONCURRENCY
+    );
+
+    await Promise.all(
+      group.map((batch) => postBookBatch(batch))
+    );
+  }
+}
+
+async function deleteBookFromDatabase(id) {
+  const response = await fetch(BOOKS_API, {
+    method: 'DELETE',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ id }),
+  });
+
+  await readApiResponse(
+    response,
+    'Unable to delete book'
+  );
+}
+
+async function deleteAllBooksFromDatabase() {
+  const response = await fetch(BOOKS_API, {
+    method: 'DELETE',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ all: true }),
+  });
+
+  await readApiResponse(
+    response,
+    'Unable to clear the book catalogue'
+  );
+}
+
+/*
+ * Save the changed book list without sending the whole
+ * catalogue to /api/content.
+ *
+ * New and updated books are upserted.
+ * Removed books from the currently loaded list are deleted.
+ */
+
+async function persistBooksChange(previousBooks, nextBooks) {
+  if (!Array.isArray(nextBooks)) {
+    throw new Error('Books must be an array.');
+  }
+
+  const previousIds = new Set(
+    (Array.isArray(previousBooks) ? previousBooks : [])
+      .map((book) => String(book.id))
+  );
+
+  const nextIds = new Set(
+    nextBooks.map((book) => String(book.id))
+  );
+
+  const removedIds = [...previousIds].filter(
+    (id) => !nextIds.has(id)
+  );
+
+  // Remove deleted records first.
+  for (const id of removedIds) {
+    await deleteBookFromDatabase(id);
+  }
+
+  // Upsert the records supplied by the caller.
+  await saveBooksInBatches(nextBooks);
+
+  // Only cache small catalogues locally.
+  cacheBooksLocally(nextBooks);
+}
+
+/*
+ * =========================================================
+ * LIBRARY PROVIDER
+ * =========================================================
+ */
+
 export function LibraryProvider({ children }) {
-  const [books, setBooks] = useState(initialContent.books);
+  const [books, setBooks] = useState(
+    initialContent.books
+  );
 
   const [departmentsData, setDepartmentsData] = useState(
     initialContent.departments
@@ -148,7 +356,9 @@ export function LibraryProvider({ children }) {
     initialContent.publications
   );
 
-  const [site, setSite] = useState(initialContent.site);
+  const [site, setSite] = useState(
+    initialContent.site
+  );
 
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
@@ -156,9 +366,7 @@ export function LibraryProvider({ children }) {
   const [contentReady, setContentReady] = useState(false);
   const [contentSaving, setContentSaving] = useState(false);
 
-  const [theme, setTheme] = useState(
-    () => localStorage.getItem('sggs_theme') || 'light'
-  );
+  const [theme, setTheme] = useState(getLocalTheme);
 
   const [toast, setToast] = useState('');
 
@@ -171,31 +379,39 @@ export function LibraryProvider({ children }) {
   useEffect(() => {
     let active = true;
 
-    fetch('/api/auth/session', {
-      credentials: 'include',
-    })
-      .then(async (response) => {
+    async function loadSession() {
+      try {
+        const response = await fetch(
+          '/api/auth/session',
+          {
+            method: 'GET',
+            credentials: 'include',
+            cache: 'no-store',
+          }
+        );
+
         if (!response.ok) {
-          return { authenticated: false };
+          if (active) setUser(null);
+          return;
         }
 
-        return response.json();
-      })
-      .then((data) => {
-        if (!active) return;
+        const data = await response.json();
 
-        setUser(data.user || null);
-      })
-      .catch(() => {
+        if (active) {
+          setUser(data.user || null);
+        }
+      } catch {
         if (active) {
           setUser(null);
         }
-      })
-      .finally(() => {
+      } finally {
         if (active) {
           setAuthReady(true);
         }
-      });
+      }
+    }
+
+    loadSession();
 
     return () => {
       active = false;
@@ -207,11 +423,10 @@ export function LibraryProvider({ children }) {
    * LOAD CONTENT FROM NEON
    * =========================================================
    *
-   * Neon is the production source of truth.
+   * Books use /api/books.
+   * Other content uses /api/content.
    *
-   * We do NOT automatically POST the initial React state.
-   * This prevents default/empty local data from overwriting
-   * the database.
+   * Do not automatically POST initial state to the database.
    */
 
   useEffect(() => {
@@ -219,126 +434,128 @@ export function LibraryProvider({ children }) {
 
     async function loadContentFromServer() {
       try {
-        const response = await fetch('/api/content', {
-          method: 'GET',
-          credentials: 'include',
-          cache: 'no-store',
-        });
+        /*
+         * Fetch non-book content and the first book page
+         * independently.
+         */
+        const [contentResult, booksResult] =
+          await Promise.allSettled([
+            fetch(CONTENT_API, {
+              method: 'GET',
+              credentials: 'include',
+              cache: 'no-store',
+            }),
 
-        if (!response.ok) {
-          throw new Error(
-            `Content API returned ${response.status}`
-          );
-        }
-
-        const data = await response.json();
+            readBooksFromDatabase(),
+          ]);
 
         if (!active) return;
 
-        let loadedBooks = Array.isArray(data.books)
-          ? data.books
-          : [];
+        /*
+         * Apply non-book content.
+         */
 
-        try {
-          const databaseBooks = await readBooksFromDatabase();
+        if (contentResult.status === 'fulfilled') {
+          const response = contentResult.value;
 
-          if (databaseBooks.length > 0) {
-            loadedBooks = databaseBooks;
-          } else if (loadedBooks.length > 0) {
-            // Migrate the small legacy JSONB catalogue once,
-            // before the first new-table write.
-            const migrationResponse = await fetch('/api/books', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ books: loadedBooks }),
-            });
+          const data = await readApiResponse(
+            response,
+            'Unable to load library content'
+          );
 
-            if (!migrationResponse.ok) {
-              console.warn(
-                'Legacy books could not be migrated to the books table.'
-              );
-            }
+          if (!active) return;
+
+          /*
+           * Intentionally do not read data.books.
+           * The book catalogue is managed separately.
+           */
+
+          if (Array.isArray(data.departments)) {
+            setDepartmentsData(data.departments);
+
+            safeSetLocal(
+              'sggs_departments',
+              data.departments
+            );
           }
-        } catch (booksError) {
-          console.warn(
-            'Could not load the separate books table; using legacy content books:',
-            booksError
+
+          if (Array.isArray(data.resources)) {
+            setResources(data.resources);
+
+            safeSetLocal(
+              'sggs_resources',
+              data.resources
+            );
+          }
+
+          // if (Array.isArray(data.papers)) {
+          //   setPapers(data.papers);
+          //   safeSetLocal('sggs_papers', data.papers);
+          // }
+
+          if (Array.isArray(data.announcements)) {
+            setAnnouncements(data.announcements);
+
+            safeSetLocal(
+              'sggs_announcements',
+              data.announcements
+            );
+          }
+
+          if (Array.isArray(data.publications)) {
+            setPublications(data.publications);
+
+            safeSetLocal(
+              'sggs_publications',
+              data.publications
+            );
+          }
+
+          if (
+            data.site &&
+            typeof data.site === 'object' &&
+            !Array.isArray(data.site)
+          ) {
+            setSite(data.site);
+
+            safeSetLocal(
+              'sggs_site',
+              data.site
+            );
+          }
+        } else {
+          console.error(
+            'Failed to load library content:',
+            contentResult.reason
           );
         }
 
-        setBooks(loadedBooks);
-        cacheBooksLocally(loadedBooks);
+        /*
+         * Apply books from the database.
+         */
 
-        if (Array.isArray(data.departments)) {
-          setDepartmentsData(data.departments);
+        if (booksResult.status === 'fulfilled') {
+          const databaseBooks = booksResult.value;
 
-          safeSetLocal(
-            'sggs_departments',
-            data.departments
+          setBooks(databaseBooks);
+          cacheBooksLocally(databaseBooks);
+        } else {
+          console.error(
+            'Failed to load books:',
+            booksResult.reason
           );
+
+          /*
+           * Do not replace the current state with an empty
+           * array when the database request fails.
+           */
         }
-
-        if (Array.isArray(data.resources)) {
-          setResources(data.resources);
-
-          safeSetLocal(
-            'sggs_resources',
-            data.resources
-          );
-        }
-
-        // if (Array.isArray(data.papers)) {
-        //   setPapers(data.papers);
-        //
-        //   localStorage.setItem(
-        //     'sggs_papers',
-        //     JSON.stringify(data.papers)
-        //   );
-        // }
-
-        if (Array.isArray(data.announcements)) {
-          setAnnouncements(data.announcements);
-
-          safeSetLocal(
-            'sggs_announcements',
-            data.announcements
-          );
-        }
-
-        if (Array.isArray(data.publications)) {
-          setPublications(data.publications);
-
-          safeSetLocal(
-            'sggs_publications',
-            data.publications
-          );
-        }
-
-        if (
-          data.site &&
-          typeof data.site === 'object' &&
-          !Array.isArray(data.site)
-        ) {
-          setSite(data.site);
-
-          safeSetLocal(
-            'sggs_site',
-            data.site
-          );
-        }
-
-        setContentReady(true);
       } catch (error) {
         console.error(
           'Failed to load library content:',
           error
         );
-
-        /*
-         * LocalStorage/default data remains available as fallback.
-         */
-
+      } finally {
         if (active) {
           setContentReady(true);
         }
@@ -361,10 +578,17 @@ export function LibraryProvider({ children }) {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
 
-    localStorage.setItem(
-      'sggs_theme',
-      theme
-    );
+    try {
+      localStorage.setItem(
+        'sggs_theme',
+        theme
+      );
+    } catch (error) {
+      console.warn(
+        'Unable to save theme preference:',
+        error
+      );
+    }
   }, [theme]);
 
   /*
@@ -376,159 +600,55 @@ export function LibraryProvider({ children }) {
   useEffect(() => {
     if (!toast) return undefined;
 
-    const timer = setTimeout(
-      () => setToast(''),
-      2800
-    );
+    const timer = setTimeout(() => {
+      setToast('');
+    }, 2800);
 
     return () => clearTimeout(timer);
   }, [toast]);
 
   /*
    * =========================================================
-   * SAVE BOOKS IN BATCHES
-   * =========================================================
-   */
-
-  const saveBooksInBatches = async (allBooks) => {
-    if (!Array.isArray(allBooks)) {
-      throw new Error('Books must be provided as an array');
-    }
-
-    const batches = [];
-
-    for (
-      let start = 0;
-      start < allBooks.length;
-      start += BOOK_BATCH_SIZE
-    ) {
-      batches.push(
-        allBooks.slice(start, start + BOOK_BATCH_SIZE)
-      );
-    }
-
-    let completed = 0;
-    const concurrency = 4;
-
-    for (
-      let start = 0;
-      start < batches.length;
-      start += concurrency
-    ) {
-      const group = batches.slice(start, start + concurrency);
-
-      await Promise.all(
-        group.map(async (batch) => {
-          const response = await fetch('/api/books', {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ books: batch }),
-          });
-
-          const result = await response.json().catch(() => ({}));
-
-          if (!response.ok) {
-            throw new Error(
-              result.error ||
-              `Book batch save failed (${response.status})`
-            );
-          }
-
-          completed += 1;
-
-          setToast(
-            `Saving catalogue batches: ${completed} of ${batches.length}…`
-          );
-        })
-      );
-    }
-
-    cacheBooksLocally(allBooks);
-
-    return {
-      ok: true,
-      count: allBooks.length,
-    };
-  };
-
-  const saveBook = async (book) => {
-    const response = await fetch('/api/books', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ books: [book] }),
-    });
-
-    const result = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(
-        result.error || `Book save failed (${response.status})`
-      );
-    }
-
-    return result;
-  };
-
-  const deleteBook = async (id) => {
-    const response = await fetch('/api/books', {
-      method: 'DELETE',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id }),
-    });
-
-    const result = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(
-        result.error || `Book delete failed (${response.status})`
-      );
-    }
-
-    return result;
-  };
-
-  const clearBooks = async () => {
-    const response = await fetch('/api/books', {
-      method: 'DELETE',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ all: true }),
-    });
-
-    const result = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(
-        result.error || `Catalogue reset failed (${response.status})`
-      );
-    }
-
-    return result;
-  };
-
-  /*
-   * =========================================================
-   * SAVE ALL CONTENT TO NEON
+   * SAVE ALL CONTENT
    * =========================================================
    *
-   * Books are stored separately in the books table.
-   * This function saves the smaller site content through /api/content.
+   * Existing admin components can continue to call:
+   *
+   * await saveContent()
+   *
+   * Book changes are sent to /api/books.
+   * Non-book changes are sent to /api/content.
+   *
+   * This prevents large book arrays from being sent to
+   * /api/content and avoids Vercel request-body limits.
    */
 
   const saveContent = async (overrides = {}) => {
     setContentSaving(true);
 
     try {
-      if (overrides.books !== undefined) {
-        await saveBooksInBatches(overrides.books);
+      const hasBookOverride = Object.prototype
+        .hasOwnProperty
+        .call(overrides, 'books');
+
+      /*
+       * Save books separately only when the caller
+       * explicitly supplies a books array.
+       */
+      if (hasBookOverride) {
+        await persistBooksChange(
+          books,
+          overrides.books
+        );
+
+        setBooks(overrides.books);
       }
 
+      /*
+       * Build a payload without books.
+       */
+
       const content = {
-        // Books are stored in the dedicated books table;
-        // do not send the catalogue to /api/content.
         departments:
           overrides.departments !== undefined
             ? overrides.departments
@@ -560,26 +680,31 @@ export function LibraryProvider({ children }) {
             : site,
       };
 
-      const response = await fetch('/api/content', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(content),
-      });
+      const response = await fetch(
+        CONTENT_API,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(content),
+        }
+      );
 
-      const data = await response.json().catch(() => ({}));
+      const data = await response
+        .json()
+        .catch(() => ({}));
 
       if (!response.ok) {
         throw new Error(
           data.error ||
-          `Save failed with status ${response.status}`
+            `Save failed with status ${response.status}`
         );
       }
 
       /*
-       * Keep localStorage as a local cache only.
+       * Cache only non-book content locally.
        */
 
       safeSetLocal(
@@ -592,10 +717,7 @@ export function LibraryProvider({ children }) {
         content.resources
       );
 
-      // localStorage.setItem(
-      //   'sggs_papers',
-      //   JSON.stringify(content.papers)
-      // );
+      // safeSetLocal('sggs_papers', content.papers);
 
       safeSetLocal(
         'sggs_announcements',
@@ -622,8 +744,7 @@ export function LibraryProvider({ children }) {
       );
 
       setToast(
-        error.message ||
-        'Unable to save changes'
+        error.message || 'Unable to save changes'
       );
 
       throw error;
@@ -634,14 +755,12 @@ export function LibraryProvider({ children }) {
 
   /*
    * =========================================================
-   * UPLOAD MEDIA TO VERCEL BLOB
+   * UPLOAD MEDIA
    * =========================================================
    *
    * Usage:
-   *
    * const result = await uploadMedia(file);
-   *
-   * result.url = permanent Blob URL
+   * result.url contains the uploaded media URL.
    */
 
   const uploadMedia = async (file) => {
@@ -651,23 +770,25 @@ export function LibraryProvider({ children }) {
 
     const formData = new FormData();
 
-    formData.append(
-      'file',
-      file
+    formData.append('file', file);
+
+    const response = await fetch(
+      '/api/upload',
+      {
+        method: 'POST',
+        credentials: 'include',
+        body: formData,
+      }
     );
 
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      credentials: 'include',
-      body: formData,
-    });
-
-    const data = await response.json().catch(() => ({}));
+    const data = await response
+      .json()
+      .catch(() => ({}));
 
     if (!response.ok) {
       throw new Error(
         data.error ||
-        `Upload failed with status ${response.status}`
+          `Upload failed with status ${response.status}`
       );
     }
 
@@ -689,28 +810,33 @@ export function LibraryProvider({ children }) {
    */
 
   const login = async (email, password) => {
-    const response = await fetch('/api/auth/login', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        email,
-        password,
-      }),
-    });
+    const response = await fetch(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email,
+          password,
+        }),
+      }
+    );
 
-    const data = await response.json().catch(() => ({}));
+    const data = await response
+      .json()
+      .catch(() => ({}));
 
     if (!response.ok) {
       throw new Error(
         data.error ||
-        'Invalid administrator credentials'
+          'Invalid administrator credentials'
       );
     }
 
-    setUser(data.user);
+    setUser(data.user || null);
 
     return data.user;
   };
@@ -723,10 +849,13 @@ export function LibraryProvider({ children }) {
 
   const logout = async () => {
     try {
-      await fetch('/api/auth/logout', {
-        method: 'POST',
-        credentials: 'include',
-      });
+      await fetch(
+        '/api/auth/logout',
+        {
+          method: 'POST',
+          credentials: 'include',
+        }
+      );
     } catch {
       // Ignore logout network errors.
     }
@@ -739,8 +868,9 @@ export function LibraryProvider({ children }) {
    * UPDATE E-RESOURCES ONLY
    * =========================================================
    *
-   * This updates only the E-Resources collection.
-   * Other library content remains unchanged.
+   * This changes only E-Resources.
+   * Other library content and the book catalogue remain
+   * unchanged.
    */
 
   const resetResources = async () => {
@@ -762,47 +892,84 @@ export function LibraryProvider({ children }) {
    * RESET DEMO CONTENT
    * =========================================================
    *
-   * This resets React state and saves the defaults to Neon.
+   * This is a destructive reset:
+   * it clears the book table and restores default books,
+   * then restores the other default content.
    */
 
   const resetDemo = async () => {
     const nextBooks = clone(defaultBooks);
     const nextDepartments = clone(departments);
     const nextResources = clone(defaultResources);
+
     // const nextPapers = clone(defaultPapers);
-    const nextAnnouncements = clone(defaultAnnouncements);
-    const nextPublications = clone(defaultPublications);
+
+    const nextAnnouncements = clone(
+      defaultAnnouncements
+    );
+
+    const nextPublications = clone(
+      defaultPublications
+    );
+
     const nextSite = clone(defaultSite);
 
     setBooks(nextBooks);
     setDepartmentsData(nextDepartments);
     setResources(nextResources);
+
     // setPapers(nextPapers);
+
     setAnnouncements(nextAnnouncements);
     setPublications(nextPublications);
     setSite(nextSite);
 
-    await clearBooks();
-    await saveBooksInBatches(nextBooks);
+    try {
+      /*
+       * Reset the catalogue intentionally.
+       */
+      await deleteAllBooksFromDatabase();
 
-    await saveContent({
-      departments: nextDepartments,
-      resources: nextResources,
-      // papers: nextPapers,
-      announcements: nextAnnouncements,
-      publications: nextPublications,
-      site: nextSite,
-    });
+      await saveBooksInBatches(nextBooks);
 
-    setToast(
-      'Demo content restored'
-    );
+      cacheBooksLocally(nextBooks);
+
+      /*
+       * Save all remaining content without a books field.
+       */
+      await saveContent({
+        departments: nextDepartments,
+        resources: nextResources,
+
+        // papers: nextPapers,
+
+        announcements: nextAnnouncements,
+        publications: nextPublications,
+        site: nextSite,
+      });
+
+      setToast('Demo content restored');
+    } catch (error) {
+      console.error(
+        'Failed to reset demo content:',
+        error
+      );
+
+      setToast(
+        error.message || 'Unable to reset demo content'
+      );
+
+      throw error;
+    }
   };
 
   /*
    * =========================================================
    * CONTEXT VALUE
    * =========================================================
+   *
+   * Keep the existing public context properties so the
+   * current pages can continue using useLibrary().
    */
 
   const value = useMemo(
@@ -838,10 +1005,6 @@ export function LibraryProvider({ children }) {
       logout,
 
       saveContent,
-      saveBooksInBatches,
-      saveBook,
-      deleteBook,
-      clearBooks,
       uploadMedia,
 
       theme,
@@ -886,5 +1049,10 @@ export function LibraryProvider({ children }) {
   );
 }
 
-export const useLibrary = () =>
-  useContext(Ctx);
+/*
+ * =========================================================
+ * USE LIBRARY
+ * =========================================================
+ */
+
+export const useLibrary = () => useContext(Ctx);
